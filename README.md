@@ -1,99 +1,325 @@
-Write‑Up— NotADemocraticElection (CTF Blockchain)
-Tujuan dokumen: menjelaskan dari nol sampai dapat flag. 
-1) Gambaran Singkat (Apa yang kita lakukan?)
-Ini challenge smart contract bertema ‘kekuatan uang menentukan pemenang’. Ada dua pihak: ALF dan CIM. Tugas kita: membuat kandidat ‘CIM’ jadi pemenang (bytes3 = 0x43494d), sesuai checker di kontrak Setup. Setelah status solved = true, kita klaim flag via menu TCP terpisah.
-•	Kontrak target diakses lewat RPC HTTP (JSON‑RPC).
-•	Flag diambil lewat service TCP (menu) — bukan lewat RPC.
-•	Agar bisa deposit/vote, kita butuh saldo (ETH) untuk biaya + nilai deposit.
-Real‑case Analogy (kenapa ini penting?)
-Bayangkan pemilu yang sebenarnya: kalau sistemnya cacat (siapa bayar paling banyak menang), demokrasi rusak. Di dunia nyata, ini mirip vote‑buying / pay‑to‑play di governance token DeFi. Challenge ini melatih kita memahami alur interaksi on‑chain (funding, call fungsi, event log) dan integrasi off‑chain service (menu TCP) yang melakukan verifikasi sebelum mengeluarkan flag.
-2) Endpoint & Akun yang Terlibat
-RPC (HTTP, JSON‑RPC): http://83.136.255.235:36473
-Menu TCP (nc): 83.136.255.235:42915
-Menu TCP memberikan informasi penting (‘Connection information’) seperti private key solver, address solver, alamat Setup & Target khusus session‑mu. Jadi, selalu ambil data terbaru dari opsi (1).
-printf "1\r\n" | nc -v 83.136.255.235 42915
-Perintah di atas memilih menu ‘1’ untuk menampilkan info koneksi. Output yang contoh kita lihat:
-Private key     :  0x67f9d8dc31675e...a19dfd
-Address         :  0x85259126F1862083d02FC8A1853fafe44Da6B1A0
-Target contract :  0x70514fa75836f0544F9A777913799Bd43DB70448
-Setup contract  :  0x2573F4b37129cF205E46BA05A2E93aF461bb0AAe
-Arti data:
-•	Private key + Address: akun ‘solver’ yang dipakai checker back‑end untuk validasi saat klaim flag.
-•	Target contract: alamat NotADemocraticElection yang harus kita interaksi (deposit + vote).
-•	Setup contract: kontrak checker; solved jika winner() == 0x43494d (‘CIM’).
-3) Persiapan CLI (Foundry + netcat)
-•	Pastikan 'forge' dan 'cast' ada di PATH.
+# 🗳️ NotADemocraticElection — Humanized Write-Up (Foundry/Cast)
+
+![Foundry](https://img.shields.io/badge/Tooling-Foundry%20%7C%20forge%20%26%20cast-6E56CF)
+![RPC](https://img.shields.io/badge/RPC-JSON--RPC-blue)
+![ChainID](https://img.shields.io/badge/Chain%20ID-31337-0A7EA4)
+![Difficulty](https://img.shields.io/badge/Difficulty-Easy%20to%20Medium-22C55E)
+![Status](https://img.shields.io/badge/Status-Solved-brightgreen)
+
+> **Goal singkat**: bikin pemenang jadi **CIM** (bytes3 `"CIM"` = `0x43494d`), sehingga `Setup.isSolved()` → **true**; lalu klaim **flag** via menu TCP.
+
+---
+
+## 📚 Table of Contents
+- [Konsep Singkat](#konsep-singkat)
+- [Arsitektur Tantangan](#arsitektur-tantangan)
+- [Prasyarat](#prasyarat)
+- [Informasi Koneksi (Menu TCP)](#informasi-koneksi-menu-tcp)
+- [Setup Environment](#setup-environment)
+- [Langkah Penyelesaian](#langkah-penyelesaian)
+- [Verifikasi](#verifikasi)
+- [Klaim Flag](#klaim-flag)
+- [Diagram Alur ASCII](#diagram-alur-ascii)
+- [Troubleshooting](#troubleshooting)
+- [Kenapa Ini Bekerja?](#kenapa-ini-bekerja)
+- [Skrip Otomasi](#skrip-otomasi)
+- [Catatan & Tips](#catatan--tips)
+
+---
+
+## 🧠 Konsep Singkat
+Di dunia ini, “demokrasi” hanya nama. Untuk bisa memilih, kamu **wajib deposit 1000 ETH**. Pemenangnya pun dipaksa jadi **CIM**. Tugasmu: **deposit → vote "CIM" → verifikasi solved → ambil flag**.
+
+---
+
+## 🏗️ Arsitektur Tantangan
+
+- **RPC JSON-RPC (HTTP)**: `http://83.136.255.235:36473`  
+  Dipakai oleh **cast/forge** (Foundry).
+- **Menu TCP (plain text)**: `83.136.255.235:42915`  
+  Dipakai untuk **ambil info instance** & **klaim flag**.
+
+**Kontrak:**
+- `Target` = NotADemocraticElection (tempat deposit & vote)
+- `Setup`  = checker, expose `TARGET()` & `isSolved()`
+
+**Kandidat:**
+- **CIM** = `bytes3("CIM")` = `0x43494d` ✅ (harus jadi winner)
+
+---
+
+## 🧰 Prasyarat
+- Foundry (forge, cast) terpasang & PATH benar.
+- `jq` (untuk parsing JSON sederhana).
+- `nc`/`netcat` untuk akses menu TCP.
+
+**Cek Foundry:**
+```bash
+which forge
+which cast
+# idealnya -> ~/.config/.foundry/bin/forge & cast
+```
+
+> Jika muncul error “ZOE … unknown option (--rpc-url)”, PATH-mu salah (bukan Foundry). Perbaiki:
+```bash
+echo 'export PATH="$HOME/.config/.foundry/bin:$PATH"' >> ~/.zshenv
+source ~/.zshenv
+```
+
+---
+
+## 🔑 Informasi Koneksi (Menu TCP)
+Ambil data instance spesifikmu dari menu:
+```bash
+printf "1
+" | nc -v 83.136.255.235 42915
+```
+Kamu akan mendapat:
+- `Private key`  → **PK_SOLVER**
+- `Address`      → **SOLVER**
+- `Target`       → **TARGET**
+- `Setup`        → **SETUP**
+
+> Data ini **unik per instance**. Jangan campur dengan instance lain, kalau tidak akan muncul **“Conditions not satisfied!”** saat klaim.
+
+---
+
+## ⚙️ Setup Environment
+```bash
+# RPC server untuk JSON-RPC
 export RPC_URL=http://83.136.255.235:36473
-export PK_SOLVER=0x67f9d8dc31675ec75197049d73ac90d9058b11c664e4f961d6b11bfcd0a19dfd
+
+# Dari menu "1 - Connection information"
+export PK_SOLVER=0x...           # private key solver yang diberikan menu
 export SOLVER=$(cast wallet address --private-key "$PK_SOLVER")
-Ini menyetel variabel lingkungan agar semua perintah ‘cast’ mengarah ke RPC yang benar dan memakai key solver yang diberikan service.
-4) Danai Akun Solver (supaya bisa Deposit + Gas)
-Biasanya RPC menyediakan akun ‘funder’ yang ‘unlocked’. Kita cek akun yang tersedia:
-cast rpc eth_accounts -r "$RPC_URL"
-Pilih salah satu sebagai FUNDER (mis. 0xD4DD…6744). Kirim 1200 ETH ke SOLVER (untuk deposit 1000 ETH + biaya gas).
-export FUNDER=0xd4dd339a15c992c59d6eb76f552f13593ea66744
-cast send "$SOLVER" --from "$FUNDER" --unlocked -r "$RPC_URL" --value 1200ether --gas-limit 21000
-Tujuan perintah: melakukan transfer ETH sederhana dari FUNDER ke SOLVER. — ‘--unlocked’ artinya node mengizinkan pengiriman tanpa private key lokal (akun dibuka di node). — ‘--gas-limit 21000’ karena ini TX transfer biasa.
+export TARGET=0x...              # target dari menu
+export SETUP=0x...               # setup dari menu
+
+# (opsional) akun donor di node untuk mendanai SOLVER
+export FUNDER=$(cast rpc eth_accounts -r "$RPC_URL" | jq -r '.[0]')
+```
+
+Sanity check:
+```bash
+cast code "$SETUP" -r "$RPC_URL" | head -c 2  # -> 0x
+cast call "$SETUP" "TARGET()(address)" -r "$RPC_URL"  # = $TARGET
+cast call "$SETUP" "isSolved()(bool)" -r "$RPC_URL"   # harus false sebelum solve
+```
+
+---
+
+## ✅ Langkah Penyelesaian
+
+### 1) Danai SOLVER (butuh > 1000 ETH)
+```bash
+cast send "$SOLVER"   --from "$FUNDER" --unlocked   -r "$RPC_URL"   --value 1200ether   --gas-limit 21000
+```
+Tujuan: **deposit** butuh **1000 ETH**, sisanya buat gas.
+
+Cek saldo:
+```bash
 cast balance "$SOLVER" -r "$RPC_URL"
-Cek saldo solver untuk memastikan cukup sebelum lanjut.
-5) Verifikasi Alamat & Status Kontrak
-export SETUP=0x2573F4b37129cF205E46BA05A2E93aF461bb0AAe
-export TARGET=0x70514fa75836f0544F9A777913799Bd43DB70448
-cast code  "$SETUP"  -r "$RPC_URL" | head -c 2      # harus '0x'
-cast call  "$SETUP"  "TARGET()(address)" -r "$RPC_URL"  # harus sama dengan $TARGET
-cast call  "$SETUP"  "isSolved()(bool)" -r "$RPC_URL"   # awalnya false
-Arti: ‘cast code’ memastikan alamat berisi bytecode. ‘cast call’ membaca state view function dari kontrak.
-6) Deposit 1000 ETH ke Kontrak Target
-cast send "$TARGET" "depositVoteCollateral(string,string)" "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER" --value 1000ether --gas-limit 300000
-Fungsi ini menyimpan kolateral besar (1000 ETH). Dua string ‘Sato’ dan ‘shiNakamoto’ hanyalah parameter metadata yang disyaratkan fungsi (misal sebagai identitas/komentar). Intinya: syarat ‘uang menentukan suara’.
-Event log yang muncul meng-catat siapa yang deposit dan berapa nilainya. Ini membantu audit/transparansi on‑chain.
-7) Vote untuk Kandidat 'CIM' (0x43494d)
-# 'CIM' dalam ASCII = 0x43 0x49 0x4D => bytes3 0x43494d
-cast send "$TARGET" "vote(bytes3,string,string)" 0x43494d "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER" --gas-limit 300000
-Fungsi vote() menulis pilihan kandidat. Tantangan ini mengecek pemenang via winner(). Kita harus memastikan winner() == 0x43494d agar Setup.isSolved() menjadi true.
-cast call "$TARGET" "winner()(bytes3)" -r "$RPC_URL"   # hasil: 0x43494d
-cast call "$SETUP"  "isSolved()(bool)"  -r "$RPC_URL"  # hasil: true
-8) Klaim Flag via Menu TCP
-Setelah solved = true, gunakan menu TCP. Biasanya urutan input yang diterima: pilih opsi (3), masukkan address solver, lalu alamat Setup.
-( printf "3\r\n"; sleep 0.2; printf "%s\r\n" "$SOLVER"; sleep 0.2; printf "%s\r\n" "$SETUP"; ) | nc -v 83.136.255.235 42915
-Output yang benar akan menampilkan flag seperti:
-HTB{h4sh_c0ll1s10n_t0_br1ng_b4ck_d3m0cr4cy}
-Kalau ‘Conditions not satisfied!’, berarti salah alamat, salah urutan, atau state on‑chain belum sesuai (winner bukan CIM / saldo kurang / deposit belum).
-9) Error Umum & Cara Mengatasi
-•	Insufficient funds for gas * price + value — Akun pengirim tidak punya cukup ETH untuk biaya gas + nilai transfer/deposit. Solusi: top‑up dulu (funding).
-•	Already deposited — Kamu memanggil deposit dua kali dari address yang sama. Solusi: lanjut langsung ke vote(), atau pakai address lain bila desainnya per‑address.
-•	invalid value '' for '[TO]' — Variabel alamat kosong (contoh $TARGET belum ter‑set). Solusi: echo variabel, pastikan tidak kosong sebelum cast send.
-•	RPC vs Menu: Port 36473 (HTTP RPC) berbeda dengan 42915 (TCP menu). Jangan ‘cast’ ke 42915, dan jangan ‘netcat’ ke 36473.
-•	Address Campur — Jangan pakai alamat hasil deploy di lokal (127.0.0.1) untuk remote RPC, gunakan alamat yang diberikan oleh menu (opsi 1).
-10) Kenapa 'CIM' bisa jadi winner?
-Berdasarkan interaksi dan event, kontrak menentukan pemenang berdasar deposit dan input kandidat. Kita melakukan deposit besar (1000 ETH) dan vote untuk kandidat CIM (0x43494d). Kontrak lalu menetapkan winner() = CIM. Checker Setup hanya mengecek kondisi ini agar isSolved() = true.
-Intinya: kita tidak eksploitasi bug rumit; kita mengikuti ‘aturan curang’ sistem dengan menyediakan deposit besar agar pilihan kita yang menang. Inilah sindiran ke ‘Not A Democratic Election’.
-11) Ringkasan Perintah & Tujuan
-printf "1\r\n" | nc -v host 42915
-→ Ambil info koneksi (private key solver, alamat Setup/Target).
-cast rpc eth_accounts
-→ Lihat akun unlocked di node (calon FUNDER).
-cast send "$SOLVER" --from "$FUNDER" --unlocked --value 1200ether
-→ Danai solver untuk deposit + gas.
-cast code "$SETUP"
-→ Pastikan alamat kontrak valid (berisi bytecode).
-cast call "$SETUP" "TARGET()(address)"
-→ Konfirmasi alamat target dari Setup.
-cast call "$SETUP" "isSolved()(bool)"
-→ Cek status solved sebelum/sesudah aksi.
-cast send "$TARGET" "depositVoteCollateral(...)" --value 1000ether
-→ Deposit kolateral agar suara ‘bernilai’.
-cast send "$TARGET" "vote(bytes3,...)" 0x43494d
-→ Pilih kandidat CIM (0x43494d).
-cast call "$TARGET" "winner()(bytes3)"
-→ Verifikasi pemenang di kontrak target.
-(printf "3"; ... ) | nc host 42915
-→ Klaim flag (opsi 3, kirim SOLVER dan SETUP).
-12) Catatan Keamanan & Praktik Baik
-•	Jangan pakai private key personal di lingkungan CTF publik. Gunakan key dari challenge saja.
-•	Bedakan ‘local testnet’ dengan ‘remote RPC’ — alamat kontrak berbeda.
-•	Selalu verifikasi state di chain sebelum klaim flag (winner & isSolved).
-•	Simpan command & TX hash untuk audit (reproducible write‑up).
-Penutup
-Dengan alur di atas, kamu menyiapkan environment, mendanai akun solver, mengeksekusi deposit dan vote yang tepat, memverifikasi state di on‑chain, lalu mengeksekusi klaim flag via menu TCP. Hasil akhirnya: flag keluar. Jika ada bagian yang ingin diperdalam (mis. decoding event log, ABI, atau menulis script otomatisasi), bilang — bisa kita tambah versi scripting penuh.
-<img width="432" height="622" alt="image" src="https://github.com/user-attachments/assets/212d5e5e-43d9-46cf-8734-5ec50b719b97" />
+```
+
+### 2) Deposit 1000 ETH
+```bash
+cast send "$TARGET"   "depositVoteCollateral(string,string)" "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER"   --value 1000ether --gas-limit 300000
+```
+Tujuan: memenuhi syarat “boleh memilih”.
+
+> Jika keluar `execution reverted: Already deposited`, artinya kamu sudah deposit. Lanjut ke vote.
+
+### 3) Vote untuk CIM
+```bash
+# "CIM" -> bytes3 -> 0x43494d
+cast send "$TARGET"   "vote(bytes3,string,string)" 0x43494d "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER"   --gas-limit 300000
+```
+Tujuan: set pemenang menjadi **CIM**.
+
+---
+
+## 🔍 Verifikasi
+```bash
+cast call "$TARGET" "winner()(bytes3)" -r "$RPC_URL"   # -> 0x43494d
+cast call "$SETUP"  "isSolved()(bool)" -r "$RPC_URL"   # -> true
+```
+
+---
+
+## 🏁 Klaim Flag
+Gunakan menu TCP (**bukan** JSON-RPC):
+```bash
+# urutan input: 3 -> SOLVER -> SETUP
+( printf "3
+"; sleep 0.2; printf "%s
+" "$SOLVER"; sleep 0.2; printf "%s
+" "$SETUP"; )   | nc -v 83.136.255.235 42915
+# contoh output:
+# HTB{h4sh_c0ll1s10n_t0_br1ng_b4ck_d3m0cr4cy}
+```
+
+---
+
+## 🔎 Diagram Alur ASCII
+
+```
++------------------+
+|  TCP :42915      |
+|  "1" -> INFO     |
++--------+---------+
+         |
+         v  (PK_SOLVER, SOLVER, TARGET, SETUP)
++--------+---------+
+|  Env Vars        |
+|  RPC=:36473      |
++--------+---------+
+         |
+         v
++--------+---------+         +-------------------------+
+|  FUNDER (rich)   |  ETH -> |      SOLVER (your acc) |
++--------+---------+         +-----------+-------------+
+                                         |
+                                         v
+                         +---------------+------------------+
+                         |      TARGET (contract)          |
+                         | 1) deposit 1000 ETH             |
+                         | 2) vote bytes3("CIM")=0x43494d  |
+                         +---------------+------------------+
+                                         |
+                                         v
+                         +---------------+------------------+
+                         |      SETUP (checker)            |
+                         | isSolved() == true?             |
+                         +---------------+------------------+
+                                         |
+                                         v
+                         +---------------+------------------+
+                         |   TCP :42915 -> "3" Get flag    |
+                         |   send SOLVER, then SETUP       |
+                         +----------------------------------+
+```
+
+---
+
+## 🧯 Troubleshooting
+
+- **`invalid HTTP version parsed`**  
+  Kamu salah port; itu terjadi kalau `cast` diarahkan ke **42915**. Gunakan **36473** untuk `cast/forge`. Port **42915** hanya untuk **nc**.
+
+- **`Insufficient funds for gas * price + value`**  
+  Saldo pengirim kurang. Danai SOLVER dari akun FUNDER node.
+
+- **`execution reverted: Already deposited`**  
+  Deposit sudah pernah dilakukan. Langsung vote saja.
+
+- **`invalid value '' for '[TO]': invalid string length`**  
+  Variabel kosong (contoh `$TARGET` belum terisi). Echo semua env sebelum kirim tx.
+
+- **`Conditions not satisfied!` saat klaim**  
+  - Kamu salah **SOLVER** atau **SETUP** (pakai yang dari **menu 1**).
+  - Kamu solve di chain/RPC lain.
+  - Belum deposit 1000 ETH / belum vote CIM.
+
+---
+
+## 🧩 Kenapa Ini Bekerja?
+- Kontrak mendesain **syarat deposit** sebagai “akses ke hak pilih”.  
+- Pemenang diharapkan **CIM** (bukan demokrasi sungguhan).  
+- `Setup.isSolved()` memverifikasi state di `Target` (pemenang == `0x43494d`).  
+- Service TCP memetakan **instance kamu** (SETUP/TARGET/SOLVER) → kalau cocok & solved, flag keluar.
+
+---
+
+## ⚡ Skrip Otomasi
+
+### `solve.sh`
+Otomatis: **fund → deposit → vote → verifikasi**.  
+Butuh: `RPC_URL`, `PK_SOLVER`, `TARGET`, `SETUP` (dan `jq`).
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${RPC_URL:?set RPC_URL=http://83.136.255.235:36473}"
+: "${PK_SOLVER:?set PK_SOLVER from menu 1}"
+: "${TARGET:?set TARGET from menu 1}"
+: "${SETUP:?set SETUP from menu 1}"
+
+SOLVER=$(cast wallet address --private-key "$PK_SOLVER")
+
+echo "[i] SOLVER        = $SOLVER"
+echo "[i] TARGET        = $TARGET"
+echo "[i] SETUP         = $SETUP"
+echo "[i] RPC_URL       = $RPC_URL"
+
+# pick a rich account on the node if FUNDER not provided
+FUNDER="${FUNDER:-$(cast rpc eth_accounts -r "$RPC_URL" | jq -r '.[0]')}"
+echo "[i] FUNDER        = $FUNDER"
+
+# fund SOLVER if needed
+BAL_WEI=$(cast balance "$SOLVER" -r "$RPC_URL")
+NEED_WEI=$(cast --to-wei 1100ether)
+
+if [ "$BAL_WEI" -lt "$NEED_WEI" ]; then
+  echo "[+] Funding SOLVER with 1200 ETH from $FUNDER"
+  cast send "$SOLVER" --from "$FUNDER" --unlocked -r "$RPC_URL" --value 1200ether --gas-limit 21000
+else
+  echo "[i] SOLVER already funded (balance $(cast --from-wei "$BAL_WEI") ETH)"
+fi
+
+echo "[+] Deposit 1000 ETH"
+cast send "$TARGET" "depositVoteCollateral(string,string)" "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER"   --value 1000ether --gas-limit 300000 || true
+
+echo "[+] Vote CIM (0x43494d)"
+cast send "$TARGET" "vote(bytes3,string,string)" 0x43494d "Sato" "shiNakamoto"   -r "$RPC_URL" --private-key "$PK_SOLVER"   --gas-limit 300000
+
+echo "[?] winner   = $(cast call "$TARGET" "winner()(bytes3)" -r "$RPC_URL")"
+echo "[?] isSolved = $(cast call "$SETUP"  "isSolved()(bool)" -r "$RPC_URL")"
+```
+
+### `auto-claim.sh`
+Otomatis: **menu 3 → kirim SOLVER → kirim SETUP**.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${1:-83.136.255.235}"
+PORT="${2:-42915}"
+SOLVER="${3:?usage: $0 [host] [port] <solver_address> <setup_address>}"
+SETUP="${4:?usage: $0 [host] [port] <solver_address> <setup_address>}"
+
+echo "[i] Claiming on $HOST:$PORT"
+{
+  printf "3
+"
+  sleep 0.2
+  printf "%s
+" "$SOLVER"
+  sleep 0.2
+  printf "%s
+" "$SETUP"
+  sleep 0.2
+} | nc -v -w 4 "$HOST" "$PORT" || {
+  echo "[!] connection/claim failed"; exit 1;
+}
+```
+
+---
+
+## 📝 Catatan & Tips
+- **Jangan** panggil `cast` ke port 42915 — itu **menu teks**, bukan JSON-RPC.  
+- Selalu echo env sebelum kirim tx:
+  ```bash
+  echo "$RPC_URL"; echo "$SOLVER"; echo "$TARGET"; echo "$SETUP"
+  ```
+- Jika gas price tinggi dan gagal pendanaan, kurangi value/naikkan saldo FUNDER.
+
+> Hasil akhir sukses terlihat sebagai:
+> - `winner = 0x43494d`
+> - `isSolved = true`
+> - Menu TCP “3 – Get flag” mengeluarkan flag 🎉
+
+---
+
+Happy hunting & have fun! 🛠️🧩
