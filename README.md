@@ -1,4 +1,4 @@
-# 🗳️ NotADemocraticElection — Humanized Write-Up (Foundry/Cast)
+# 🗳️ NotADemocraticElection — Humanized Write-Up (Foundry/Castpemai)
 
 ![Foundry](https://img.shields.io/badge/Tooling-Foundry%20%7C%20forge%20%26%20cast-6E56CF)
 ![RPC](https://img.shields.io/badge/RPC-JSON--RPC-blue)
